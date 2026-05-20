@@ -446,6 +446,33 @@ def is_profile_locked(profile_name: str = "default") -> bool:
     return lock_file.exists()
 
 
+def clean_profile_lock(profile_name: str = "default") -> bool:
+    """Remove stale SingletonLock file for a profile.
+
+    Chrome creates a SingletonLock file in the user-data-dir to prevent
+    multiple instances from using the same profile. If Chrome crashes or
+    is killed improperly, this lock file can remain, blocking future launches.
+
+    Only call this after verifying no Chrome process is actually using the
+    profile (via find_existing_nlm_chrome / find_any_existing_cdp_browser).
+
+    Returns:
+        True if a lock file was cleaned up, False otherwise.
+    """
+    profile_dir = get_chrome_profile_dir(profile_name)
+    lock_file = profile_dir / "SingletonLock"
+    if not lock_file.exists():
+        return False
+    lock_file.unlink(missing_ok=True)
+    _logger.debug("Removed stale SingletonLock for profile %s", profile_name)
+    # Also clean up SingletonSocket and SingletonCookie which can also cause issues
+    for stale_file in ("SingletonSocket", "SingletonCookie"):
+        path = profile_dir / stale_file
+        if path.exists():
+            path.unlink(missing_ok=True)
+    return True
+
+
 def find_existing_nlm_chrome(
     port_range: range = CDP_PORT_RANGE, profile_name: str = "default"
 ) -> tuple[int | None, str | None]:
@@ -947,6 +974,58 @@ def _kill_process(pid: int) -> None:
         pass
 
 
+def _kill_processes_using_profile(profile_name: str = "default") -> int:
+    """Kill any Chrome process using our --user-data-dir, regardless of CDP state.
+
+    This catches Chrome instances that aren't in the port map and don't have
+    CDP enabled — the main cause of 'Failed to create a ProcessSingleton' errors.
+
+    Returns:
+        Number of processes killed.
+    """
+    profile_dir = str(get_chrome_profile_dir(profile_name))
+    killed = 0
+
+    if platform.system() == "Windows":
+        # Use wmic on Windows to find processes with matching command line
+        try:
+            result = subprocess.run(
+                ["wmic", "process", "where", "name='chrome.exe'", "get", "processid,commandline"],
+                capture_output=True, text=True, check=False,
+            )
+            for line in result.stdout.splitlines():
+                if profile_dir.lower() in line.lower():
+                    parts = line.strip().split()
+                    if parts and parts[0].isdigit():
+                        _kill_process(int(parts[0]))
+                        killed += 1
+        except Exception:
+            pass
+    else:
+        # Scan /proc on Linux/macOS
+        proc_dir = Path("/proc")
+        if not proc_dir.exists():
+            return 0
+        for proc_entry in proc_dir.iterdir():
+            if not proc_entry.name.isdigit():
+                continue
+            cmdline_path = proc_entry / "cmdline"
+            try:
+                cmdline = cmdline_path.read_bytes().decode("utf-8", errors="replace")
+                if "--user-data-dir=" in cmdline and profile_dir in cmdline:
+                    pid = int(proc_entry.name)
+                    # Don't kill ourselves
+                    if pid == os.getpid():
+                        continue
+                    _logger.debug("Killing Chrome process %d using profile %s", pid, profile_name)
+                    _kill_process(pid)
+                    killed += 1
+            except (PermissionError, FileNotFoundError, ProcessLookupError):
+                continue
+
+    return killed
+
+
 def _kill_stale_nlm_browsers() -> None:
     """Kill browser processes started by NLM that are no longer responsive on CDP."""
     port_map = _read_port_map()
@@ -1013,12 +1092,20 @@ def extract_cookies_via_cdp(
         reused_existing = True
 
     if not debugger_url and auto_launch:
+        # Kill any Chrome process using our profile dir (even without CDP)
+        killed = _kill_processes_using_profile(profile_name)
+        if killed:
+            _logger.info("Killed %d Chrome process(es) using profile %s", killed, profile_name)
+            # Clean up lock files left by killed processes
+            clean_profile_lock(profile_name)
+
         if is_profile_locked(profile_name):
-            # Profile locked but no browser found on known ports - stale lock?
-            raise AuthenticationError(
-                message="The NLM auth profile is locked but no browser instance was found",
-                hint=f"Close any stuck browser processes or delete the SingletonLock file in the {profile_name} browser profile.",
+            # Profile locked but no browser found on known ports - clean stale lock
+            _logger.warning(
+                "Profile %s locked but no browser found. Cleaning stale lock file.",
+                profile_name,
             )
+            clean_profile_lock(profile_name)
 
         if not get_chrome_path():
             browser_names = get_supported_browsers()
@@ -1046,9 +1133,8 @@ def extract_cookies_via_cdp(
                 hint="Try 'nlm login --manual' to import cookies from a file.",
             )
 
-        # Snap Chromium and some Chromium forks can take noticeably longer
-        # to expose CDP than the browser window itself takes to appear.
-        debugger_url = get_debugger_url(port, tries=30)
+        # Chrome should expose CDP within a few seconds; if not, it's not starting
+        debugger_url = get_debugger_url(port, tries=4)
 
     if not debugger_url:
         startup_error = _summarize_browser_startup_failure(_chrome_process)
@@ -1364,3 +1450,81 @@ def run_headless_auth(
         # Don't terminate if we connected to existing Chrome instance
         if chrome_process and not chrome_was_running:
             terminate_chrome(chrome_process, port)
+
+
+def browser_login(
+    profile_name: str = "default",
+    clear_profile: bool = False,
+) -> dict[str, Any]:
+    """Open NotebookLM in the default browser and extract auth from pasted cookies.
+
+    This is a simpler alternative to CDP-based login that works with any browser.
+
+    Args:
+        profile_name: NLM profile name.
+        clear_profile: If True, delete the Chrome user-data-dir before saving.
+
+    Returns:
+        Dict with cookies, csrf_token, session_id, build_label, and email.
+    """
+    import webbrowser
+
+    from notebooklm_tools.utils.browser import (
+        validate_notebooklm_cookies,
+    )
+
+    if clear_profile:
+        profile_dir = get_chrome_profile_dir(profile_name)
+        if profile_dir.exists():
+            shutil.rmtree(profile_dir, ignore_errors=True)
+
+    # Open NotebookLM in default browser
+    _logger.info("Opening %s in default browser", NOTEBOOKLM_URL)
+    webbrowser.open(NOTEBOOKLM_URL)
+
+    # Show instructions
+    print("\n1. Log in to NotebookLM in your browser")
+    print("2. Open DevTools (F12) → Network tab")
+    print("3. Refresh the page and click any 'batchexecute' request")
+    print("4. Go to Headers tab → Request Headers → find 'Cookie'")
+    print("5. Copy the entire Cookie value and paste it below:\n")
+
+    cookie_string = input("Cookie: ").strip()
+
+    if not cookie_string:
+        raise AuthenticationError(
+            message="No cookie string provided",
+            hint="Copy the Cookie header value from DevTools and paste it here.",
+        )
+
+    # Parse cookie string
+    cookies: dict[str, str] = {}
+    for part in cookie_string.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, _, value = part.partition("=")
+            name = name.strip()
+            value = value.strip()
+            if name and value:
+                cookies[name] = value
+
+    if not cookies:
+        raise AuthenticationError(
+            message="Could not parse cookies",
+            hint="Paste the full Cookie header value from DevTools.",
+        )
+
+    # Validate
+    if not validate_notebooklm_cookies(cookies):
+        raise AuthenticationError(
+            message="Cookies don't appear to be valid for NotebookLM",
+            hint="Make sure you're logged into NotebookLM and copied the Cookie header from a batchexecute request.",
+        )
+
+    return {
+        "cookies": cookies,
+        "csrf_token": "",
+        "session_id": "",
+        "build_label": "",
+        "email": "",
+    }
