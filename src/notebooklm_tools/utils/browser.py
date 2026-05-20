@@ -100,3 +100,59 @@ def validate_notebooklm_cookies(cookies: dict[str, str]) -> bool:
     essential_patterns = ["SID", "HSID", "SSID", "APISID", "SAPISID"]
     found = sum(1 for pattern in essential_patterns if any(pattern in name for name in cookies))
     return found >= 2  # At least 2 essential cookies should be present
+
+
+def parse_cookies_from_curl(curl: str) -> dict[str, str]:
+    """Extract cookies from a cURL command's Cookie header."""
+    match = re.search(r"-H\s+['\"]Cookie:\s*([^'\"]+)['\"]", curl, re.IGNORECASE)
+    if not match:
+        raise AuthenticationError(
+            message="No Cookie header found in cURL command",
+            hint="Make sure you copied the full cURL command including -H 'Cookie: ...' headers.",
+        )
+
+    cookie_string = match.group(1)
+    cookies: dict[str, str] = {}
+    for part in cookie_string.split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, _, value = part.partition("=")
+            name = name.strip()
+            value = value.strip()
+            if name and value:
+                cookies[name] = value
+
+    if not cookies:
+        raise AuthenticationError(
+            message="Could not parse cookies from cURL command",
+            hint="Ensure the cURL command contains valid Cookie headers.",
+        )
+
+    return cookies
+
+
+def extract_csrf_from_curl(curl: str) -> str:
+    """Extract CSRF token (at= parameter) from cURL request body."""
+    # The at= value is embedded in JSON within the --data-raw argument.
+    # Shell escaping makes it hard to parse the data cleanly, so we just
+    # search for the "at":"..." pattern directly.
+    match = re.search(r'"at":"([^"]+)"', curl)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def extract_session_id_from_curl(curl: str) -> str:
+    """Extract session ID (f.sid= parameter) from cURL URL."""
+    match = re.search(r"[?&]f\.sid=(\d+)", curl)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def extract_build_label_from_curl(curl: str) -> str:
+    """Extract build label (bl= parameter) from cURL URL."""
+    match = re.search(r"[?&]bl=([^&'\"]+)", curl)
+    if match:
+        return match.group(1)
+    return ""

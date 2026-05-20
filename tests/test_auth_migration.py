@@ -249,7 +249,7 @@ class TestCDPStartupHandling:
         ):
             extract_cookies_via_cdp()
 
-        mock_get_debugger_url.assert_called_once_with(9222, tries=30)
+        mock_get_debugger_url.assert_called_once_with(9222, tries=4)
 
     def test_extract_cookies_reuses_single_existing_cdp_browser(self):
         """A single reachable existing CDP browser should be reused."""
@@ -680,3 +680,47 @@ class TestPageFetchHeaders:
     def test_user_agent_is_present(self):
         """User-Agent header must still be present."""
         assert "User-Agent" in self._get_headers()
+
+
+class TestBrowserLogin:
+    """Tests for the default browser login flow (open URL + paste cookie header)."""
+
+    SAMPLE_COOKIES = "SID=a; HSID=b; SSID=c; APISID=d; SAPISID=e"
+
+    def test_browser_login_parses_cookies(self):
+        from notebooklm_tools.utils.cdp import browser_login
+
+        with (
+            patch("webbrowser.open") as mock_open,
+            patch("builtins.input", return_value=self.SAMPLE_COOKIES),
+        ):
+            result = browser_login()
+
+        mock_open.assert_called_once()
+        assert result["cookies"]["SID"] == "a"
+        assert result["cookies"]["HSID"] == "b"
+        assert result["csrf_token"] == ""
+        assert result["session_id"] == ""
+        assert result["build_label"] == ""
+
+    def test_browser_login_raises_on_empty_input(self):
+        from notebooklm_tools.utils.cdp import browser_login
+        from notebooklm_tools.core.exceptions import AuthenticationError
+
+        with (
+            patch("webbrowser.open"),
+            patch("builtins.input", return_value=""),
+        ):
+            with pytest.raises(AuthenticationError, match="No cookie string provided"):
+                browser_login()
+
+    def test_browser_login_raises_on_invalid_cookies(self):
+        from notebooklm_tools.utils.cdp import browser_login
+        from notebooklm_tools.core.exceptions import AuthenticationError
+
+        with (
+            patch("webbrowser.open"),
+            patch("builtins.input", return_value="foo=bar"),
+        ):
+            with pytest.raises(AuthenticationError, match="don't appear to be valid"):
+                browser_login()

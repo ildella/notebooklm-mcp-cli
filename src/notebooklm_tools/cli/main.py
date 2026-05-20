@@ -96,6 +96,11 @@ def login_callback(
         "-m",
         help="Manually provide cookies from a file",
     ),
+    chrome: bool = typer.Option(
+        False,
+        "--chrome",
+        help="Use Chrome DevTools Protocol (launches Chrome for automatic extraction)",
+    ),
     check: bool = typer.Option(
         False,
         "--check",
@@ -142,7 +147,9 @@ def login_callback(
     """
     Authenticate with NotebookLM.
 
-    Default: Uses Chrome DevTools Protocol to extract cookies automatically.
+    Default: Opens your default browser and guides you through copying auth
+    from DevTools. Works with any browser.
+    Use --chrome to launch Chrome with automatic cookie extraction via CDP.
     Use --manual to import cookies from a file.
     Use --check to validate existing credentials.
     Use --provider openclaw --cdp-url <url> to read auth from an existing
@@ -250,169 +257,163 @@ def login_callback(
         # user explicitly passes their own --cdp-url value.
         _BUILTIN_CDP_DEFAULT = "http://127.0.0.1:18800"
 
-        if wsl:
-            # WSL mode: Launch Windows Chrome from WSL to avoid terminal corruption
-            from notebooklm_tools.utils.wsl import (
-                check_firewall_rule,
-                get_windows_host_ip,
-                is_wsl,
-                launch_windows_chrome,
-                terminate_windows_chrome,
-                wait_for_cdp,
-            )
-
-            if not is_wsl():
-                console.print(
-                    "[yellow]Warning:[/yellow] --wsl flag used but not in WSL environment. Ignoring."
-                )
-            else:
-                from notebooklm_tools.utils.wsl import DEFAULT_WSL_CDP_PORT
-
-                wsl_port = DEFAULT_WSL_CDP_PORT
-                # Chrome binds to localhost only (newer Chrome ignores
-                # --remote-debugging-address=0.0.0.0), so we launch it
-                # on a different port and rely on a netsh portproxy rule
-                # (listenport=wsl_port -> connectport=chrome_port) to
-                # bridge WSL traffic to localhost.
-                chrome_port = wsl_port + 1
-                windows_ip = get_windows_host_ip()
-
-                if not windows_ip:
-                    console.print("[red]Error:[/red] Could not determine Windows host IP.")
-                    console.print("[dim]Hint: Check /etc/resolv.conf in WSL[/dim]")
-                    raise typer.Exit(1)
-
-                wsl_cdp_url = f"http://{windows_ip}:{wsl_port}"
-
-                console.print("[bold]WSL2 detected - launching Windows Chrome[/bold]")
-                console.print(
-                    f"[dim]Windows host: {windows_ip}:{wsl_port} (proxy) -> localhost:{chrome_port} (Chrome)[/dim]"
-                )
-                console.print("[dim]Chrome binds to localhost; netsh portproxy bridges WSL[/dim]")
-
-                # Check Windows Firewall
-
-                if not check_firewall_rule(wsl_port):
-                    console.print("\n[yellow]Windows Firewall Setup Required[/yellow]")
-                    console.print(
-                        f"\nA firewall rule is needed to allow WSL to connect to Windows Chrome on port {wsl_port}."
-                    )
-                    console.print(
-                        "\n[bold]Step 1:[/bold] Open [cyan]Windows PowerShell as Administrator[/cyan] and run:"
-                    )
-                    console.print(
-                        f'\n  New-NetFirewallRule -DisplayName "NotebookLM-CDP-{wsl_port}" -Direction Inbound -Action Allow -Protocol TCP -LocalPort {wsl_port} -RemoteAddress LocalSubnet\n'
-                    )
-                    console.print(
-                        "[bold]Step 2:[/bold] After running the command above, press [bold]Enter[/bold] here to continue..."
-                    )
-
-                    # Simple wait for Enter
-                    input()
-
-                    # Re-check if rule was created
-                    if check_firewall_rule(wsl_port):
-                        console.print("[green]✓[/green] Firewall rule detected!")
-                    else:
-                        console.print(
-                            "[yellow]Warning:[/yellow] Rule not yet detected, but will attempt to continue..."
-                        )
-                    console.print()
-                else:
-                    console.print("[dim]Windows Firewall: rule exists[/dim]")
-                console.print()
-
-                try:
-                    chrome_process = launch_windows_chrome(chrome_port)
-                    console.print(f"[dim]Chrome PID: {chrome_process.pid}[/dim]")
-                except RuntimeError as e:
-                    console.print(f"[red]Error:[/red] {e}")
-                    console.print("[dim]Hint: Ensure Chrome is installed on Windows side[/dim]")
-                    raise typer.Exit(1) from e
-
-                console.print("[dim]Waiting for Chrome DevTools Protocol...[/dim]")
-                if not wait_for_cdp(wsl_cdp_url, timeout=30):
-                    console.print("[red]Error:[/red] Chrome did not start within 30 seconds.")
-                    console.print("\n[yellow]Troubleshooting:[/yellow]")
-                    console.print("  1. Ensure the Windows Firewall rule was created (step above)")
-                    console.print("  2. If Chrome is still running, close it and retry")
-                    console.print("  3. Or use manual mode: nlm login --manual --file <path>")
-                    terminate_windows_chrome(chrome_process)
-                    raise typer.Exit(1)
-
-                console.print("[green]✓[/green] Chrome ready, connecting...\n")
-
-                try:
-                    result = extract_cookies_via_existing_cdp(
-                        cdp_url=wsl_cdp_url,
-                        wait_for_login=True,
-                        login_timeout=300,
-                    )
-                finally:
-                    # Always terminate Windows Chrome
-                    terminate_windows_chrome(chrome_process)
-
-                launched_local_chrome = True
-
-        elif provider == "openclaw" or (provider == "builtin" and cdp_url != _BUILTIN_CDP_DEFAULT):
-            # External CDP path: connect to an already-running browser.
-            # Triggered by --provider openclaw OR when the user explicitly
-            # passes a --cdp-url (indicating they have a running Chrome).
-            label = "openclaw" if provider == "openclaw" else "builtin (external CDP)"
-            console.print("[bold]Using external CDP authentication[/bold]")
-            console.print(f"[dim]Provider: {label} | CDP: {cdp_url}[/dim]\n")
-
-            result = extract_cookies_via_existing_cdp(
-                cdp_url=cdp_url,
-                wait_for_login=True,
-                login_timeout=300,
-            )
-        else:
-            # Default: builtin CDP mode - managed Chrome profile
+        if chrome:
+            # Chrome CDP mode: launch Chrome for automatic extraction
             from notebooklm_tools.utils.cdp import get_browser_display_name, get_chrome_path
 
-            # Detect browser early so messages show the correct name
-            get_chrome_path()
-            browser_name = get_browser_display_name()
-            console.print(f"[bold]Launching {browser_name} for authentication...[/bold]")
-            console.print("[dim]Using Chrome DevTools Protocol[/dim]\n")
+            if wsl:
+                # WSL mode: Launch Windows Chrome from WSL to avoid terminal corruption
+                from notebooklm_tools.utils.wsl import (
+                    check_firewall_rule,
+                    get_windows_host_ip,
+                    is_wsl,
+                    launch_windows_chrome,
+                    terminate_windows_chrome,
+                    wait_for_cdp,
+                )
 
-            from notebooklm_tools.utils.config import (
-                check_migration_sources,
-                get_storage_dir,
-                run_migration,
-            )
+                if not is_wsl():
+                    console.print(
+                        "[yellow]Warning:[/yellow] --wsl flag used but not in WSL environment. Ignoring."
+                    )
+                else:
+                    from notebooklm_tools.utils.wsl import DEFAULT_WSL_CDP_PORT
 
-            # Check if we need to migrate from legacy packages
-            # IMPORTANT: Don't use get_chrome_profile_dir() here as it creates the directory,
-            # which would prevent migration from running
-            chrome_profile = get_storage_dir() / "chrome-profile"
-            profile_exists = chrome_profile.exists() and (
-                (chrome_profile / "Default").exists() or (chrome_profile / "Local State").exists()
-            )
+                    wsl_port = DEFAULT_WSL_CDP_PORT
+                    chrome_port = wsl_port + 1
+                    windows_ip = get_windows_host_ip()
 
-            if not profile_exists and not clear:
-                sources = check_migration_sources()
-                if sources["chrome_profiles"]:
-                    console.print("[yellow]Found Chrome profile from legacy installation![/yellow]")
-                    for src in sources["chrome_profiles"]:
-                        console.print(f"  [dim]{src}[/dim]")
-                    console.print("[dim]Migrating to new location...[/dim]")
+                    if not windows_ip:
+                        console.print("[red]Error:[/red] Could not determine Windows host IP.")
+                        console.print("[dim]Hint: Check /etc/resolv.conf in WSL[/dim]")
+                        raise typer.Exit(1)
 
-                    actions = run_migration(dry_run=False)
-                    for action in actions:
-                        console.print(f"  [green]✓[/green] {action}")
+                    wsl_cdp_url = f"http://{windows_ip}:{wsl_port}"
+
+                    console.print("[bold]WSL2 detected - launching Windows Chrome[/bold]")
+                    console.print(
+                        f"[dim]Windows host: {windows_ip}:{wsl_port} (proxy) -> localhost:{chrome_port} (Chrome)[/dim]"
+                    )
+                    console.print("[dim]Chrome binds to localhost; netsh portproxy bridges WSL[/dim]")
+
+                    if not check_firewall_rule(wsl_port):
+                        console.print("\n[yellow]Windows Firewall Setup Required[/yellow]")
+                        console.print(
+                            f"\nA firewall rule is needed to allow WSL to connect to Windows Chrome on port {wsl_port}."
+                        )
+                        console.print(
+                            "\n[bold]Step 1:[/bold] Open [cyan]Windows PowerShell as Administrator[/cyan] and run:"
+                        )
+                        console.print(
+                            f'\n  New-NetFirewallRule -DisplayName "NotebookLM-CDP-{wsl_port}" -Direction Inbound -Action Allow -Protocol TCP -LocalPort {wsl_port} -RemoteAddress LocalSubnet\n'
+                        )
+                        console.print(
+                            "[bold]Step 2:[/bold] After running the command above, press [bold]Enter[/bold] here to continue..."
+                        )
+
+                        input()
+
+                        if check_firewall_rule(wsl_port):
+                            console.print("[green]✓[/green] Firewall rule detected!")
+                        else:
+                            console.print(
+                                "[yellow]Warning:[/yellow] Rule not yet detected, but will attempt to continue..."
+                            )
+                        console.print()
+                    else:
+                        console.print("[dim]Windows Firewall: rule exists[/dim]")
                     console.print()
 
-            console.print(f"Starting {browser_name}...")
-            result = extract_cookies_via_cdp(
-                auto_launch=True,
-                wait_for_login=True,
-                login_timeout=300,
+                    try:
+                        chrome_process = launch_windows_chrome(chrome_port)
+                        console.print(f"[dim]Chrome PID: {chrome_process.pid}[/dim]")
+                    except RuntimeError as e:
+                        console.print(f"[red]Error:[/red] {e}")
+                        console.print("[dim]Hint: Ensure Chrome is installed on Windows side[/dim]")
+                        raise typer.Exit(1) from e
+
+                    console.print("[dim]Waiting for Chrome DevTools Protocol...[/dim]")
+                    if not wait_for_cdp(wsl_cdp_url, timeout=30):
+                        console.print("[red]Error:[/red] Chrome did not start within 30 seconds.")
+                        console.print("\n[yellow]Troubleshooting:[/yellow]")
+                        console.print("  1. Ensure the Windows Firewall rule was created (step above)")
+                        console.print("  2. If Chrome is still running, close it and retry")
+                        console.print("  3. Or use manual mode: nlm login --manual --file <path>")
+                        terminate_windows_chrome(chrome_process)
+                        raise typer.Exit(1)
+
+                    console.print("[green]✓[/green] Chrome ready, connecting...\n")
+
+                    try:
+                        result = extract_cookies_via_existing_cdp(
+                            cdp_url=wsl_cdp_url,
+                            wait_for_login=True,
+                            login_timeout=300,
+                        )
+                    finally:
+                        terminate_windows_chrome(chrome_process)
+
+                    launched_local_chrome = True
+
+            elif provider == "openclaw" or (provider == "builtin" and cdp_url != _BUILTIN_CDP_DEFAULT):
+                # External CDP path
+                label = "openclaw" if provider == "openclaw" else "builtin (external CDP)"
+                console.print("[bold]Using external CDP authentication[/bold]")
+                console.print(f"[dim]Provider: {label} | CDP: {cdp_url}[/dim]\n")
+
+                result = extract_cookies_via_existing_cdp(
+                    cdp_url=cdp_url,
+                    wait_for_login=True,
+                    login_timeout=300,
+                )
+            else:
+                # Default: builtin CDP mode - managed Chrome profile
+                get_chrome_path()
+                browser_name = get_browser_display_name()
+                console.print(f"[bold]Launching {browser_name} for authentication...[/bold]")
+                console.print("[dim]Using Chrome DevTools Protocol[/dim]\n")
+
+                from notebooklm_tools.utils.config import (
+                    check_migration_sources,
+                    get_storage_dir,
+                    run_migration,
+                )
+
+                chrome_profile = get_storage_dir() / "chrome-profile"
+                profile_exists = chrome_profile.exists() and (
+                    (chrome_profile / "Default").exists() or (chrome_profile / "Local State").exists()
+                )
+
+                if not profile_exists and not clear:
+                    sources = check_migration_sources()
+                    if sources["chrome_profiles"]:
+                        console.print("[yellow]Found Chrome profile from legacy installation![/yellow]")
+                        for src in sources["chrome_profiles"]:
+                            console.print(f"  [dim]{src}[/dim]")
+                        console.print("[dim]Migrating to new location...[/dim]")
+
+                        actions = run_migration(dry_run=False)
+                        for action in actions:
+                            console.print(f"  [green]✓[/green] {action}")
+                        console.print()
+
+                console.print(f"Starting {browser_name}...")
+                result = extract_cookies_via_cdp(
+                    auto_launch=True,
+                    wait_for_login=True,
+                    login_timeout=300,
+                    profile_name=profile,
+                    clear_profile=clear,
+                )
+                launched_local_chrome = True
+        else:
+            # Default: open URL in default browser, extract from pasted cURL
+            from notebooklm_tools.utils.cdp import browser_login
+
+            result = browser_login(
                 profile_name=profile,
                 clear_profile=clear,
             )
-            launched_local_chrome = True
 
         if result.get("reused_existing"):
             console.print(
